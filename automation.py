@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import requests
+from google.auth.transport.requests import Request
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -1016,9 +1017,7 @@ def youtube_service():
     )
 
     # Refresh automatically when the client needs a token.
-    credentials.refresh(
-        requests.Request()
-    )
+    credentials.refresh(Request())
 
     return build(
         "youtube",
