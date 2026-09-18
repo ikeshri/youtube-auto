@@ -1,0 +1,570 @@
+name: YouTube Auto 3x Daily
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 8 * * *"
+      timezone: "Asia/Kolkata"
+    - cron: "0 14 * * *"
+      timezone: "Asia/Kolkata"
+    - cron: "0 20 * * *"
+      timezone: "Asia/Kolkata"
+
+permissions:
+  contents: write
+
+jobs:
+  youtube-auto:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+
+      - name: Create state folder
+        run: |
+          mkdir -p data
+          touch data/used_videos.txt
+
+      - name: Run YouTube automation
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          VIZARD_API_KEY: ${{ secrets.VIZARD_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cat > automation.py <<'PY'
+          import os
+          import re
+          import json
+          import time
+          import requests
+          from datetime import datetime, timezone
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          YT_API = "https://www.googleapis.com/youtube/v3"
+          VIZARD_CREATE = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/create"
+          VIZARD_QUERY = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/{}"
+
+          YT_KEY = os.environ["YOUTUBE_API_KEY"]
+          YT_CLIENT_ID = os.environ["YOUTUBE_CLIENT_ID"]
+          YT_CLIENT_SECRET = os.environ["YOUTUBE_CLIENT_SECRET"]
+          YT_REFRESH = os.environ["YOUTUBE_REFRESH_TOKEN"]
+          VIZARD_KEY = os.environ["VIZARD_API_KEY"]
+          TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+          TG_CHAT = os.environ["TELEGRAM_CHAT_ID"]
+
+          STATE_FILE = "data/used_videos.txt"
+
+          def telegram(message):
+              try:
+                  url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+                  requests.post(
+                      url,
+                      json={
+                          "chat_id": TG_CHAT,
+                          "text": message,
+                          "disable_web_page_preview": True
+                      },
+                      timeout=30
+                  )
+              except Exception as e:
+                  print("Telegram error:", e)
+
+          def fail(message):
+              telegram("🚨 YouTube Automation ERROR\n\n" + message)
+              raise RuntimeError(message)
+
+          def get_used():
+              if not os.path.exists(STATE_FILE):
+                  return set()
+              with open(STATE_FILE, "r", encoding="utf-8") as f:
+                  return {x.strip() for x in f if x.strip()}
+
+          def save_used(video_id):
+              with open(STATE_FILE, "a", encoding="utf-8") as f:
+                  f.write(video_id + "\n")
+
+          def iso_duration_seconds(value):
+              m = re.fullmatch(
+                  r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
+                  value or ""
+              )
+              if not m:
+                  return 0
+              h = int(m.group(1) or 0)
+              mi = int(m.group(2) or 0)
+              s = int(m.group(3) or 0)
+              return h * 3600 + mi * 60 + s
+
+          def youtube_get(path, params):
+              params["key"] = YT_KEY
+              r = requests.get(YT_API + path, params=params, timeout=30)
+              if r.status_code != 200:
+                  fail(
+                      f"YouTube API error {r.status_code}\n"
+                      f"{r.text[:1500]}"
+                  )
+              return r.json()
+
+          def find_source():
+              used = get_used()
+
+              # First: today's popular videos in India.
+              data = youtube_get(
+                  "/videos",
+                  {
+                      "part": "snippet,contentDetails,statistics",
+                      "chart": "mostPopular",
+                      "regionCode": "IN",
+                      "maxResults": 50
+                  }
+              )
+
+              candidates = []
+
+              for item in data.get("items", []):
+                  vid = item["id"]
+                  snippet = item.get("snippet", {})
+                  details = item.get("contentDetails", {})
+
+                  if vid in used:
+                      continue
+
+                  # Only prioritize Creative Commons.
+                  if snippet.get("license") != "creativeCommon":
+                      continue
+
+                  duration = iso_duration_seconds(
+                      details.get("duration", "")
+                  )
+
+                  # Keep source reasonably short to reduce Vizard usage.
+                  if duration < 60 or duration > 180:
+                      continue
+
+                  candidates.append({
+                      "id": vid,
+                      "title": snippet.get("title", "Untitled"),
+                      "channel": snippet.get("channelTitle", "Unknown"),
+                      "url": f"https://www.youtube.com/watch?v={vid}",
+                      "duration": duration
+                  })
+
+              if candidates:
+                  return candidates[0]
+
+              # Fallback: search CC videos around useful topics.
+              topics = [
+                  "technology",
+                  "AI",
+                  "science",
+                  "space",
+                  "interesting facts",
+                  "future technology",
+                  "nature",
+                  "inventions",
+                  "gaming",
+                  "business"
+              ]
+
+              # Rotate topic using current hour.
+              hour = datetime.now().hour
+              topic = topics[hour % len(topics)]
+
+              data = youtube_get(
+                  "/search",
+                  {
+                      "part": "snippet",
+                      "q": topic,
+                      "type": "video",
+                      "videoLicense": "creativeCommon",
+                      "videoDuration": "short",
+                      "order": "viewCount",
+                      "maxResults": 25,
+                      "regionCode": "IN",
+                      "relevanceLanguage": "en",
+                      "safeSearch": "moderate"
+                  }
+              )
+
+              ids = [
+                  x["id"]["videoId"]
+                  for x in data.get("items", [])
+                  if x.get("id", {}).get("videoId")
+                  and x["id"]["videoId"] not in used
+              ]
+
+              if not ids:
+                  fail("No unused Creative Commons source video found.")
+
+              details = youtube_get(
+                  "/videos",
+                  {
+                      "part": "snippet,contentDetails",
+                      "id": ",".join(ids[:20])
+                  }
+              )
+
+              for item in details.get("items", []):
+                  vid = item["id"]
+                  snippet = item.get("snippet", {})
+
+                  if snippet.get("license") != "creativeCommon":
+                      continue
+
+                  duration = iso_duration_seconds(
+                      item.get("contentDetails", {}).get("duration", "")
+                  )
+
+                  if 60 <= duration <= 180:
+                      return {
+                          "id": vid,
+                          "title": snippet.get("title", "Untitled"),
+                          "channel": snippet.get(
+                              "channelTitle", "Unknown"
+                          ),
+                          "url": f"https://www.youtube.com/watch?v={vid}",
+                          "duration": duration
+                      }
+
+              fail("No suitable Creative Commons video found.")
+
+          def vizard_create(source):
+              headers = {
+                  "Content-Type": "application/json",
+                  "VIZARDAI_API_KEY": VIZARD_KEY
+              }
+
+              payload = {
+                  "lang": "auto",
+                  "preferLength": [2],
+                  "videoUrl": source["url"],
+                  "videoType": 2,
+                  "ratioOfClip": 1,
+                  "subtitleSwitch": 1,
+                  "headlineSwitch": 1,
+                  "removeSilenceSwitch": 1,
+                  "maxClipNumber": 1,
+                  "clipModel": "clip_v1",
+                  "projectName": source["title"][:100]
+              }
+
+              r = requests.post(
+                  VIZARD_CREATE,
+                  headers=headers,
+                  json=payload,
+                  timeout=60
+              )
+
+              if r.status_code != 200:
+                  fail(
+                      f"Vizard API request failed.\n"
+                      f"HTTP: {r.status_code}\n"
+                      f"{r.text[:2000]}"
+                  )
+
+              try:
+                  data = r.json()
+              except Exception:
+                  fail("Vizard returned invalid JSON.")
+
+              if data.get("code") != 2000:
+                  fail(
+                      "Vizard rejected the video.\n"
+                      + json.dumps(data, ensure_ascii=False)[:2000]
+                  )
+
+              project_id = data.get("projectId")
+
+              if not project_id:
+                  fail(
+                      "Vizard response has no projectId.\n"
+                      + json.dumps(data, ensure_ascii=False)[:2000]
+                  )
+
+              return project_id
+
+          def vizard_wait(project_id):
+              headers = {
+                  "VIZARDAI_API_KEY": VIZARD_KEY
+              }
+
+              for attempt in range(40):
+                  r = requests.get(
+                      VIZARD_QUERY.format(project_id),
+                      headers=headers,
+                      timeout=60
+                  )
+
+                  if r.status_code != 200:
+                      fail(
+                          f"Vizard status request failed.\n"
+                          f"HTTP: {r.status_code}\n"
+                          f"{r.text[:1500]}"
+                      )
+
+                  data = r.json()
+
+                  videos = data.get("videos") or []
+
+                  if videos:
+                      valid = []
+
+                      for video in videos:
+                          url = video.get("videoUrl")
+                          if url:
+                              valid.append(video)
+
+                      if valid:
+                          # Prefer a clip between 30 and 60 seconds.
+                          valid.sort(
+                              key=lambda x: abs(
+                                  int(x.get("videoMsDuration", 60000))
+                                  - 60000
+                              )
+                          )
+                          return valid[0]
+
+                  code = data.get("code")
+
+                  if code not in (2000, None):
+                      fail(
+                          "Vizard processing failed.\n"
+                          + json.dumps(data, ensure_ascii=False)[:2000]
+                      )
+
+                  print(
+                      f"Vizard processing... "
+                      f"{attempt + 1}/40"
+                  )
+                  time.sleep(30)
+
+              fail(
+                  "Vizard processing timed out after approximately "
+                  "20 minutes."
+              )
+
+          def download_video(url):
+              path = "short.mp4"
+
+              with requests.get(
+                  url,
+                  stream=True,
+                  timeout=120
+              ) as r:
+                  if r.status_code != 200:
+                      fail(
+                          f"Could not download Vizard output.\n"
+                          f"HTTP: {r.status_code}"
+                      )
+
+                  with open(path, "wb") as f:
+                      for chunk in r.iter_content(1024 * 1024):
+                          if chunk:
+                              f.write(chunk)
+
+              if not os.path.exists(path):
+                  fail("Vizard output file was not created.")
+
+              size = os.path.getsize(path)
+
+              if size < 10000:
+                  fail("Downloaded video file is unexpectedly small.")
+
+              return path
+
+          def youtube_service():
+              refresh = YT_REFRESH.strip()
+
+              # Supports either a raw refresh token or a JSON token object.
+              if refresh.startswith("{"):
+                  token_data = json.loads(refresh)
+                  refresh_token = token_data.get("refresh_token")
+                  token = token_data.get("token")
+              else:
+                  refresh_token = refresh
+                  token = None
+
+              if not refresh_token:
+                  fail("YOUTUBE_REFRESH_TOKEN does not contain a refresh token.")
+
+              creds = Credentials(
+                  token=token,
+                  refresh_token=refresh_token,
+                  token_uri="https://oauth2.googleapis.com/token",
+                  client_id=YT_CLIENT_ID,
+                  client_secret=YT_CLIENT_SECRET,
+                  scopes=["https://www.googleapis.com/auth/youtube.upload"]
+              )
+
+              return build(
+                  "youtube",
+                  "v3",
+                  credentials=creds,
+                  cache_discovery=False
+              )
+
+          def upload_youtube(video_path, source, vizard_video):
+              youtube = youtube_service()
+
+              title = vizard_video.get("title") or source["title"]
+
+              # Keep title safely below YouTube's 100-character limit.
+              title = re.sub(r"\s+", " ", title).strip()
+              title = title[:95]
+
+              description = (
+                  "Short video generated from a Creative Commons source "
+                  "and edited automatically.\n\n"
+                  "Original source:\n"
+                  f"{source['url']}\n\n"
+                  f"Original title: {source['title']}\n"
+                  f"Original creator/channel: {source['channel']}\n"
+                  "License: Creative Commons Attribution (CC BY) "
+                  "as indicated by YouTube.\n\n"
+                  "#Shorts"
+              )
+
+              body = {
+                  "snippet": {
+                      "title": title,
+                      "description": description,
+                      "tags": [
+                          "Shorts",
+                          "YouTube Shorts",
+                          "viral",
+                          "trending"
+                      ],
+                      "categoryId": "22"
+                  },
+                  "status": {
+                      "privacyStatus": "public",
+                      "selfDeclaredMadeForKids": False
+                  }
+              }
+
+              media = MediaFileUpload(
+                  video_path,
+                  mimetype="video/mp4",
+                  resumable=True
+              )
+
+              request = youtube.videos().insert(
+                  part="snippet,status",
+                  body=body,
+                  media_body=media
+              )
+
+              response = request.execute()
+
+              video_id = response.get("id")
+
+              if not video_id:
+                  fail(
+                      "YouTube upload returned no video ID.\n"
+                      + json.dumps(response, ensure_ascii=False)[:1500]
+                  )
+
+              return video_id, title
+
+          def main():
+              telegram(
+                  "🤖 YouTube Automation started\n"
+                  "🔎 Finding a fresh rights-cleared source..."
+              )
+
+              source = find_source()
+
+              print("SOURCE:")
+              print(json.dumps(source, indent=2, ensure_ascii=False))
+
+              telegram(
+                  "🎯 Source found\n\n"
+                  f"Title: {source['title']}\n"
+                  f"Channel: {source['channel']}\n"
+                  f"Duration: {source['duration']} sec\n"
+                  f"License: Creative Commons\n\n"
+                  "🎬 Sending to Vizard..."
+              )
+
+              project_id = vizard_create(source)
+
+              telegram(
+                  "🎬 Vizard processing started\n"
+                  f"Project: {project_id}"
+              )
+
+              vizard_video = vizard_wait(project_id)
+
+              output_url = vizard_video.get("videoUrl")
+
+              if not output_url:
+                  fail("Vizard completed but returned no video URL.")
+
+              telegram(
+                  "✅ Vizard finished\n"
+                  "⬇️ Downloading final Short..."
+              )
+
+              video_path = download_video(output_url)
+
+              telegram(
+                  "📤 Uploading Short to YouTube..."
+              )
+
+              video_id, title = upload_youtube(
+                  video_path,
+                  source,
+                  vizard_video
+              )
+
+              save_used(source["id"])
+
+              yt_url = f"https://www.youtube.com/watch?v={video_id}"
+
+              telegram(
+                  "✅ VIDEO UPLOADED SUCCESSFULLY\n\n"
+                  f"🎬 {title}\n"
+                  f"📺 {yt_url}\n"
+                  f"🕐 {datetime.now(timezone.utc).isoformat()}"
+              )
+
+              print("SUCCESS:", yt_url)
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as e:
+                  print("FATAL ERROR:", repr(e))
+                  raise
+          PY
+
+          python automation.py
+
+      - name: Save used source list
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/used_videos.txt
+          git diff --cached --quiet || git commit -m "Update used video state"
+          git push
