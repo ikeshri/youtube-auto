@@ -67,14 +67,22 @@ jobs:
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
         run: |
           python - <<'PY2'
-          import os, sys, requests
+          import os
+          import sys
+          import requests
 
-          cid = os.environ["YOUTUBE_CLIENT_ID"]
-          secret = os.environ["YOUTUBE_CLIENT_SECRET"]
-          refresh = os.environ["YOUTUBE_REFRESH_TOKEN"]
+          cid = os.environ.get("YOUTUBE_CLIENT_ID", "").strip()
+          secret = os.environ.get("YOUTUBE_CLIENT_SECRET", "").strip()
+          refresh = os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip()
+
+          print("YouTube OAuth preflight")
+          print("Client ID present:", bool(cid))
+          print("Client secret present:", bool(secret))
+          print("Refresh token present:", bool(refresh))
+          print("Refresh token length:", len(refresh))
 
           if not cid or not secret or not refresh:
-              print("ERROR: YouTube OAuth secret is missing.")
+              print("ERROR: One or more YouTube OAuth secrets are missing.")
               sys.exit(1)
 
           r = requests.post(
@@ -88,26 +96,43 @@ jobs:
               timeout=30,
           )
 
-          if r.status_code != 200:
-              try:
-                  body = r.json()
-                  err = body.get("error", "unknown")
-                  desc = body.get("error_description", "")
-              except Exception:
-                  err = "unknown"
-                  desc = r.text[:200]
+          try:
+              body = r.json()
+          except Exception:
+              body = {}
 
-              print(f"YouTube OAuth preflight FAILED: {err} {desc}")
-              print("Vizard will NOT be called.")
+          if r.status_code != 200:
+              err = body.get("error", "unknown")
+              desc = body.get("error_description", "")
+
+              print("Google OAuth response:", r.status_code)
+              print("ERROR:", err)
+              print("DETAIL:", desc)
+
+              if err == "invalid_grant":
+                  print("")
+                  print("RESULT: Google rejected the refresh token.")
+                  print("Vizard will NOT be called.")
+                  print("A fresh refresh token must be generated using THIS SAME OAuth client.")
+              elif err == "invalid_client":
+                  print("")
+                  print("RESULT: Client ID / Client Secret pairing is wrong.")
+                  print("Vizard will NOT be called.")
+              else:
+                  print("")
+                  print("RESULT: Google OAuth failed.")
+                  print("Vizard will NOT be called.")
+
               sys.exit(1)
 
-          data = r.json()
-          if not data.get("access_token"):
-              print("YouTube OAuth preflight FAILED: no access token returned.")
+          access = body.get("access_token")
+          if not access:
+              print("ERROR: Google returned no access token.")
               sys.exit(1)
 
           print("YouTube OAuth preflight: OK")
-          print("Access token received successfully.")
+          print("Google accepted the refresh token.")
+          print("Vizard is allowed to run.")
           PY2
 
       - name: Run automation
