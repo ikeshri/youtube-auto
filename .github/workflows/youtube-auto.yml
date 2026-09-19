@@ -60,6 +60,56 @@ jobs:
             google-auth-httplib2 \
             google-api-core
 
+      - name: Preflight YouTube OAuth
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          python - <<'PY2'
+          import os, sys, requests
+
+          cid = os.environ["YOUTUBE_CLIENT_ID"]
+          secret = os.environ["YOUTUBE_CLIENT_SECRET"]
+          refresh = os.environ["YOUTUBE_REFRESH_TOKEN"]
+
+          if not cid or not secret or not refresh:
+              print("ERROR: YouTube OAuth secret is missing.")
+              sys.exit(1)
+
+          r = requests.post(
+              "https://oauth2.googleapis.com/token",
+              data={
+                  "client_id": cid,
+                  "client_secret": secret,
+                  "refresh_token": refresh,
+                  "grant_type": "refresh_token",
+              },
+              timeout=30,
+          )
+
+          if r.status_code != 200:
+              try:
+                  body = r.json()
+                  err = body.get("error", "unknown")
+                  desc = body.get("error_description", "")
+              except Exception:
+                  err = "unknown"
+                  desc = r.text[:200]
+
+              print(f"YouTube OAuth preflight FAILED: {err} {desc}")
+              print("Vizard will NOT be called.")
+              sys.exit(1)
+
+          data = r.json()
+          if not data.get("access_token"):
+              print("YouTube OAuth preflight FAILED: no access token returned.")
+              sys.exit(1)
+
+          print("YouTube OAuth preflight: OK")
+          print("Access token received successfully.")
+          PY2
+
       - name: Run automation
         run: python automation.py
 
