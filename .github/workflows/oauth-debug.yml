@@ -1,0 +1,75 @@
+name: OAuth Debug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check YouTube OAuth
+        env:
+          CID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          CSECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          RTOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          cid = os.environ["CID"].strip()
+          secret = os.environ["CSECRET"].strip()
+          refresh = os.environ["RTOKEN"].strip()
+
+          print("=== GOOGLE OAUTH DEBUG ===")
+          print("Client ID present :", bool(cid))
+          print("Client ID format  :", cid.endswith(".apps.googleusercontent.com"))
+          print("Client ID length  :", len(cid))
+          print("Client Secret len :", len(secret))
+          print("Refresh Token len :", len(refresh))
+          print("Refresh starts    :", refresh[:5] if refresh else "EMPTY")
+          print("Refresh ends      :", refresh[-5:] if refresh else "EMPTY")
+
+          if not cid or not secret or not refresh:
+              raise SystemExit("ERROR: A required secret is empty.")
+
+          r = requests.post(
+              "https://oauth2.googleapis.com/token",
+              data={
+                  "client_id": cid,
+                  "client_secret": secret,
+                  "refresh_token": refresh,
+                  "grant_type": "refresh_token",
+              },
+              timeout=30,
+          )
+
+          print("HTTP STATUS       :", r.status_code)
+
+          try:
+              data = r.json()
+          except Exception:
+              data = {}
+
+          if r.status_code == 200:
+              print("================================")
+              print("GOOGLE OAUTH = SUCCESS")
+              print("Refresh token is accepted.")
+              print("Client ID + Secret + Refresh Token")
+              print("are working together.")
+              print("================================")
+              raise SystemExit(0)
+
+          print("GOOGLE ERROR      :", data.get("error"))
+          print("GOOGLE DESCRIPTION:", data.get("error_description"))
+
+          if data.get("error") == "invalid_grant":
+              print("")
+              print("IMPORTANT:")
+              print("Google received the credentials but rejected")
+              print("the refresh-token grant.")
+              print("This is NOT a Vizard error.")
+              print("This is NOT a YouTube upload-code error.")
+
+          raise SystemExit(1)
+          PY
