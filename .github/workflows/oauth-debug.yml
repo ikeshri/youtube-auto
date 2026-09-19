@@ -19,7 +19,7 @@ jobs:
 
           cid = os.environ["CID"].strip()
           secret = os.environ["CSECRET"].strip()
-          refresh = os.environ["RTOKEN"].strip()
+          refresh = os.environ["RTOKEN"].strip().strip('"')
 
           print("=== GOOGLE OAUTH DEBUG ===")
           print("Client ID present :", bool(cid))
