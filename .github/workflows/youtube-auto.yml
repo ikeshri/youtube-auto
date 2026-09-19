@@ -73,7 +73,7 @@ jobs:
 
           cid = os.environ.get("YOUTUBE_CLIENT_ID", "").strip()
           secret = os.environ.get("YOUTUBE_CLIENT_SECRET", "").strip()
-          refresh = os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip()
+          refresh = os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip().strip('"')
 
           print("YouTube OAuth preflight")
           print("Client ID present:", bool(cid))
